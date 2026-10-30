@@ -15,8 +15,10 @@ hold another head: the queue builds a pull request's groups one after another,
 so the group whose branch holds a run's head is the live one, even when a late
 event started its run before the run that looks. A pull request that returns
 to the queue on the same parent gets its earlier group's branch again, with a
-new head, so a branch that exists may still belong to a replaced run. See
-doc/ci.md, "Superseded merge groups".
+new head, so a branch that exists may still belong to a replaced run. The run
+that looks passes the same test, and cancels itself last when it fails it: a
+late event can start a replaced group's run after the run of the group that
+replaced it looked. See doc/ci.md, "Superseded merge groups".
 """
 
 from __future__ import annotations
@@ -118,10 +120,10 @@ def superseded_runs(
     workflow: str,
     run_id: int,
 ) -> list[SupersededRun]:
-    """Return the unfinished runs of `workflow` among `runs`, but `run_id`, for
-    the other merge groups of `group`'s pull request and base whose branches
-    are gone from `branches`, which maps each branch to its head, or hold
-    another head than the run's."""
+    """Return the unfinished runs of `workflow` among `runs` for the merge
+    groups of `group`'s pull request and base whose branches are gone from
+    `branches`, which maps each branch to its head, or hold another head than
+    the run's, with the run `run_id`, the caller's, last."""
     superseded: dict[int, SupersededRun] = {}
     for document in runs:
         if not isinstance(document, Mapping):
@@ -132,7 +134,6 @@ def superseded_runs(
         if (
             not isinstance(identifier, int)
             or isinstance(identifier, bool)
-            or identifier == run_id
             or run.get("event") != "merge_group"
             or run.get("status") == "completed"
             or str(run.get("path", "")).partition("@")[0] != workflow
@@ -152,7 +153,11 @@ def superseded_runs(
         superseded[identifier] = SupersededRun(
             identifier, str(run.get("html_url", "")), branch
         )
-    return [superseded[identifier] for identifier in sorted(superseded)]
+    # Cancelling the caller's own run ends it, so that comes after the others.
+    order = sorted(superseded)
+    return [superseded[identifier] for identifier in order if identifier != run_id] + [
+        superseded[identifier] for identifier in order if identifier == run_id
+    ]
 
 
 def _branch_heads(document: object) -> dict[str, str]:
@@ -161,7 +166,7 @@ def _branch_heads(document: object) -> dict[str, str]:
         raise ScriptError("GitHub returned an invalid list of references")
     heads: dict[str, str] = {}
     for item in cast(list[object], document):
-        reference = (
+        reference: Mapping[str, object] = (
             cast(Mapping[str, object], item) if isinstance(item, Mapping) else {}
         )
         name = reference.get("ref")
@@ -186,8 +191,9 @@ def cancel_superseded_merge_groups(
     ref: str,
 ) -> list[str]:
     """Cancel the unfinished runs of the workflow for the earlier merge groups
-    of the pull request of the group that `ref` names, and return a line for
-    each run that it cancelled or could not cancel."""
+    of the pull request of the group that `ref` names, and the run `run_id`
+    last if its group is one of them, and return a line for each run that it
+    cancelled or could not cancel."""
     group = merge_group(ref)
     if group is None:
         raise ScriptError(f"{ref!r} names no merge group")
@@ -227,7 +233,8 @@ def cancel_superseded_merge_groups(
         except (ScriptError, OSError) as error:
             report.append(f"could not cancel run {run.id} of `{run.branch}`: {error}")
             continue
-        report.append(f"cancelled run {run.id} of `{run.branch}`: {run.url}")
+        caller = " (this run)" if run.id == run_id else ""
+        report.append(f"cancelled run {run.id} of `{run.branch}`{caller}: {run.url}")
     return report
 
 
@@ -292,7 +299,8 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         type=positive_int,
         required=True,
         metavar="ID",
-        help="the merge group's own run, which is never cancelled",
+        help="the merge group's own run, which is cancelled last, if its group "
+        "is superseded too",
     )
     parser.add_argument(
         "--ref",
