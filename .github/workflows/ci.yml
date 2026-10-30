@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  probe:
+    name: Required status check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Record the event
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PROBE_SECRET: ${{ secrets.PROBE_SECRET }}
+          MERGE_GROUP: ${{ toJSON(github.event.merge_group) }}
+        run: |
+          echo "event=${EVENT_NAME} ref=${GITHUB_REF} sha=${GITHUB_SHA} actor=${GITHUB_ACTOR} run=${GITHUB_RUN_ID}"
+          echo "${MERGE_GROUP}"
+          git log --format='%H parents=%P %s' -6 "${GITHUB_SHA}"
+          echo "secret-present=$([[ -n "${PROBE_SECRET}" ]] && echo yes || echo no)"
+
+      - name: Wait and watch the queue branches
+        if: github.event_name == 'merge_group'
+        run: |
+          minutes=$(cat probe-minutes.txt)
+          for i in $(seq 1 "${minutes}"); do
+            echo "== $(date -u +%H:%M:%S)"
+            git ls-remote origin 'refs/heads/gh-readonly-queue/*' 'refs/heads/main'
+            sleep 60
+          done
