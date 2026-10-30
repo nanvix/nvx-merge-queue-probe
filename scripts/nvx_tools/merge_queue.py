@@ -10,10 +10,13 @@ runners to their end, although the queue never reads their checks again.
 
 ``nvx.py cancel-superseded-merge-groups`` therefore runs in each merge group's
 CI run and cancels the unfinished runs of the workflow for the pull request's
-earlier groups. It cancels only the runs of groups whose branches are gone:
-the queue builds a pull request's groups one after another, so a group whose
-branch still exists is the live one, even when a late event started its run
-before the run that looks. See doc/ci.md, "Superseded merge groups".
+earlier groups. It cancels only the runs whose groups' branches are gone or
+hold another head: the queue builds a pull request's groups one after another,
+so the group whose branch holds a run's head is the live one, even when a late
+event started its run before the run that looks. A pull request that returns
+to the queue on the same parent gets its earlier group's branch again, with a
+new head, so a branch that exists may still belong to a replaced run. See
+doc/ci.md, "Superseded merge groups".
 """
 
 from __future__ import annotations
@@ -109,15 +112,16 @@ def workflow_path(workflow_ref: str, repository: str) -> str:
 
 def superseded_runs(
     runs: Sequence[object],
-    branches: set[str],
+    branches: Mapping[str, str],
     *,
     group: MergeGroup,
     workflow: str,
     run_id: int,
 ) -> list[SupersededRun]:
     """Return the unfinished runs of `workflow` among `runs`, but `run_id`, for
-    the other merge groups of `group`'s pull request and base whose branches,
-    unlike `branches`, are gone."""
+    the other merge groups of `group`'s pull request and base whose branches
+    are gone from `branches`, which maps each branch to its head, or hold
+    another head than the run's."""
     superseded: dict[int, SupersededRun] = {}
     for document in runs:
         if not isinstance(document, Mapping):
@@ -133,16 +137,44 @@ def superseded_runs(
             or run.get("status") == "completed"
             or str(run.get("path", "")).partition("@")[0] != workflow
             or not isinstance(branch, str)
-            or branch in branches
         ):
             continue
         other = merge_group(branch)
         if other is None or (other.base, other.number) != (group.base, group.number):
             continue
+        # A run whose head the branch holds is the live group's, and so is one
+        # whose head GitHub didn't report while the branch exists.
+        head = run.get("head_sha")
+        if branch in branches and (
+            not isinstance(head, str) or branches[branch] == head
+        ):
+            continue
         superseded[identifier] = SupersededRun(
             identifier, str(run.get("html_url", "")), branch
         )
     return [superseded[identifier] for identifier in sorted(superseded)]
+
+
+def _branch_heads(document: object) -> dict[str, str]:
+    """Return the head of each branch of a list of references."""
+    if not isinstance(document, list):
+        raise ScriptError("GitHub returned an invalid list of references")
+    heads: dict[str, str] = {}
+    for item in cast(list[object], document):
+        reference = (
+            cast(Mapping[str, object], item) if isinstance(item, Mapping) else {}
+        )
+        name = reference.get("ref")
+        target = reference.get("object")
+        head = (
+            cast(Mapping[str, object], target).get("sha")
+            if isinstance(target, Mapping)
+            else None
+        )
+        if not isinstance(name, str) or not isinstance(head, str):
+            raise ScriptError("GitHub returned an invalid reference")
+        heads[name.removeprefix("refs/heads/")] = head
+    return heads
 
 
 def cancel_superseded_merge_groups(
@@ -170,26 +202,17 @@ def cancel_superseded_merge_groups(
         )
     # The branches are read after the runs, so that a run that the list shows
     # for a live group finds that group's branch.
-    document = api.get(
-        f"/repos/{repository}/git/matching-refs/heads/"
-        + urllib.parse.quote(group.prefix, safe="/")
-    )
-    if not isinstance(document, list):
-        raise ScriptError("GitHub returned an invalid list of references")
-    branches: set[str] = set()
-    for item in cast(list[object], document):
-        reference = (
-            cast(Mapping[str, object], item).get("ref")
-            if isinstance(item, Mapping)
-            else None
+    branches = _branch_heads(
+        api.get(
+            f"/repos/{repository}/git/matching-refs/heads/"
+            + urllib.parse.quote(group.prefix, safe="/")
         )
-        if not isinstance(reference, str):
-            raise ScriptError("GitHub returned an invalid reference")
-        branches.add(reference.removeprefix("refs/heads/"))
+    )
     report: list[str] = []
     for run in superseded_runs(
         runs, branches, group=group, workflow=workflow, run_id=run_id
     ):
+        # One failed cancellation never stops the others.
         try:
             api.post(f"/repos/{repository}/actions/runs/{run.id}/cancel", {})
         except GitHubApiError as error:
@@ -200,6 +223,9 @@ def cancel_superseded_merge_groups(
                 report.append(
                     f"could not cancel run {run.id} of `{run.branch}`: {error}"
                 )
+            continue
+        except (ScriptError, OSError) as error:
+            report.append(f"could not cancel run {run.id} of `{run.branch}`: {error}")
             continue
         report.append(f"cancelled run {run.id} of `{run.branch}`: {run.url}")
     return report
