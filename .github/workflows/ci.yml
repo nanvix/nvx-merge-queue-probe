@@ -24,7 +24,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
+          ref: ${{ github.event.merge_group.base_ref }}
           persist-credentials: false
+
+      - name: Show the checked-out commit
+        env:
+          BASE_REF: ${{ github.event.merge_group.base_ref }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          echo "checked-out=$(git rev-parse HEAD) group-head=${GITHUB_SHA} base-ref=${BASE_REF} base-sha=${BASE_SHA}"
+          git ls-remote origin "${BASE_REF}"
+          git log --format='%H %s' -1
 
       - name: Cancel superseded merge group runs
         shell: bash
