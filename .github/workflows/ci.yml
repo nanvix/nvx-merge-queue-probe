@@ -36,6 +36,9 @@ jobs:
           git ls-remote origin "${BASE_REF}"
           git log --format='%H %s' -1
 
+      - name: Wait for the queue to replace the group
+        run: sleep 120
+
       - name: Cancel superseded merge group runs
         shell: bash
         env:
